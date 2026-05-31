@@ -1,5 +1,5 @@
 """
-公債殖利率突破 → 基金+債券績效回測系統
+國債殖利率突破 → 基金+債券績效回測系統
 當 10Y/20Y/30Y 國債殖利率首次向上突破特定門檻時，
 分析持有的基金和債券在那之後 1M/3M/6M/1Y/2Y/3Y 的績效。
 """
@@ -159,7 +159,7 @@ FINRA_ISIN_TO_TICKER = {
 }
 
 YIELD_TICKERS = {"10年期": "DGS10", "20年期": "DGS20", "30年期": "DGS30"}
-YIELD_YAHOO   = {"10年期": "^TNX",  "20年期": None,     "30年期": "^TYX"}
+YIELD_YAHOO   = {"10年期": "^TNX",  "20年期": "^FVX",   "30年期": "^TYX"}
 
 HOLDING_PERIODS = {
     "1個月": 21, "3個月": 63, "6個月": 126,
@@ -213,47 +213,48 @@ def read_sheet_as_series(sheet_id: str, label: str) -> pd.Series:
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_yield_data(tenor: str) -> pd.Series:
-    fred_ticker  = YIELD_TICKERS[tenor]
-    yahoo_ticker = YIELD_YAHOO[tenor]
+    fred_ticker = YIELD_TICKERS[tenor]
 
-    # 嘗試 FRED
-    try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_ticker}"
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200 and len(resp.text) > 100:
-            df = pd.read_csv(StringIO(resp.text), parse_dates=[0], index_col=0)
-            df.columns = ["yield"]
-            s = pd.to_numeric(df["yield"], errors="coerce").dropna()
-            if len(s) > 100:
-                return s
-    except:
-        pass
-
-    # 備援：Yahoo Finance
-    if yahoo_ticker:
-        try:
-            import yfinance as yf
-            df = yf.download(yahoo_ticker, start="2000-01-01", progress=False, auto_adjust=True)
-            if not df.empty:
-                s = df["Close"].squeeze().rename("yield")
-                s.index = pd.to_datetime(s.index)
-                return s.dropna()
-        except:
-            pass
-
-    # 備援2：stooq
+    # 優先：stooq（無 rate limit）
     try:
         stooq_map = {"DGS10": "10y.b.us", "DGS20": "20y.b.us", "DGS30": "30y.b.us"}
-        stooq_t = stooq_map.get(fred_ticker, "10y.b.us")
-        url2 = f"https://stooq.com/q/d/l/?s={stooq_t}&i=d"
+        stooq_t = stooq_map[fred_ticker]
+        url = f"https://stooq.com/q/d/l/?s={stooq_t}&i=d"
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        df = pd.read_csv(StringIO(resp.text), parse_dates=["Date"], index_col="Date")
+        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if len(s) > 100:
+            return s.sort_index().rename("yield")
+    except Exception as e:
+        st.warning(f"stooq 失敗：{e}")
+
+    # 備援1：FRED
+    try:
+        url2 = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_ticker}"
         resp2 = requests.get(url2, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        df2 = pd.read_csv(StringIO(resp2.text), parse_dates=["Date"], index_col="Date")
-        s2 = pd.to_numeric(df2["Close"], errors="coerce").dropna()
-        if len(s2) > 100:
-            return s2.rename("yield")
+        if resp2.status_code == 200 and len(resp2.text) > 100:
+            df2 = pd.read_csv(StringIO(resp2.text), parse_dates=[0], index_col=0)
+            df2.columns = ["yield"]
+            s2 = pd.to_numeric(df2["yield"], errors="coerce").dropna()
+            if len(s2) > 100:
+                return s2
     except:
         pass
 
+    # 備援2：Yahoo Finance
+    try:
+        import yfinance as yf
+        yahoo_map = {"DGS10": "^TNX", "DGS20": "^TNX", "DGS30": "^TYX"}
+        yt = yahoo_map.get(fred_ticker, "^TNX")
+        df3 = yf.download(yt, start="2000-01-01", progress=False, auto_adjust=True)
+        if not df3.empty:
+            s3 = df3["Close"].squeeze().dropna()
+            s3.index = pd.to_datetime(s3.index)
+            return s3.rename("yield")
+    except:
+        pass
+
+    st.error("所有殖利率資料來源均失敗，請稍後再試。")
     return pd.Series(dtype=float)
 
 # ==========================================
