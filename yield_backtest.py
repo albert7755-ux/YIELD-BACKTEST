@@ -437,7 +437,7 @@ for thr in sorted(thresholds):
 
     st.dataframe(
         result_df.style
-            .applymap(color_cell)
+            .map(color_cell)
             .format(lambda x: f"{x:.2%}" if not pd.isna(x) else "-"),
         use_container_width=True, height=600
     )
