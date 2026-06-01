@@ -1,5 +1,5 @@
 """
-國債殖利率突破 → 基金+債券績效回測系統
+當公債殖利率突破 → 基金+債券績效回測系統
 當 10Y/20Y/30Y 國債殖利率首次向上突破特定門檻時，
 分析持有的基金和債券在那之後 1M/3M/6M/1Y/2Y/3Y 的績效。
 """
@@ -159,7 +159,12 @@ FINRA_ISIN_TO_TICKER = {
 }
 
 YIELD_TICKERS = {"10年期": "DGS10", "20年期": "DGS20", "30年期": "DGS30"}
-YIELD_YAHOO   = {"10年期": "^TNX",  "20年期": "^FVX",   "30年期": "^TYX"}
+YIELD_SHEETS_NAME = {"10年期": "US_YIELD_10Y", "20年期": "US_YIELD_20Y", "30年期": "US_YIELD_30Y"}
+YIELD_SHEET_IDS = {
+    "US_YIELD_10Y": "1NZ2NewtsdHMtYaCsmnrFBqiHTIsEFvlrmZSHaf1vMu4",
+    "US_YIELD_20Y": "1BOPMadnV9AZEmZDFi1wRxhqXDGkxcygqb6uDRS7qrek",
+    "US_YIELD_30Y": "1mObJF2ULlLte6cmP9claGT9kHDOjAVcEXRz-xHbeltQ",
+}
 
 HOLDING_PERIODS = {
     "1個月": 21, "3個月": 63, "6個月": 126,
@@ -213,49 +218,26 @@ def read_sheet_as_series(sheet_id: str, label: str) -> pd.Series:
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_yield_data(tenor: str) -> pd.Series:
-    fred_ticker = YIELD_TICKERS[tenor]
-
-    # 優先：stooq（無 rate limit）
+    """從 Google Drive 讀取殖利率資料（直接用固定 Sheet ID）"""
+    sheet_name = YIELD_SHEETS_NAME[tenor]
+    sheet_id = YIELD_SHEET_IDS.get(sheet_name)
+    if not sheet_id:
+        st.error(f"找不到殖利率試算表 ID：{sheet_name}")
+        return pd.Series(dtype=float)
     try:
-        stooq_map = {"DGS10": "10y.b.us", "DGS20": "20y.b.us", "DGS30": "30y.b.us"}
-        stooq_t = stooq_map[fred_ticker]
-        url = f"https://stooq.com/q/d/l/?s={stooq_t}&i=d"
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        df = pd.read_csv(StringIO(resp.text), parse_dates=["Date"], index_col="Date")
-        s = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if len(s) > 100:
-            return s.sort_index().rename("yield")
+        client = get_gspread_client()
+        sh = client.open_by_key(sheet_id)
+        ws = sh.get_worksheet(0)
+        data = ws.get_all_records()
+        df = pd.DataFrame(data)
+        df.columns = ["date", "yield"]
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["yield"] = pd.to_numeric(df["yield"], errors="coerce")
+        df = df.dropna().sort_values("date").set_index("date")
+        return df["yield"]
     except Exception as e:
-        st.warning(f"stooq 失敗：{e}")
-
-    # 備援1：FRED
-    try:
-        url2 = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={fred_ticker}"
-        resp2 = requests.get(url2, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp2.status_code == 200 and len(resp2.text) > 100:
-            df2 = pd.read_csv(StringIO(resp2.text), parse_dates=[0], index_col=0)
-            df2.columns = ["yield"]
-            s2 = pd.to_numeric(df2["yield"], errors="coerce").dropna()
-            if len(s2) > 100:
-                return s2
-    except:
-        pass
-
-    # 備援2：Yahoo Finance
-    try:
-        import yfinance as yf
-        yahoo_map = {"DGS10": "^TNX", "DGS20": "^TNX", "DGS30": "^TYX"}
-        yt = yahoo_map.get(fred_ticker, "^TNX")
-        df3 = yf.download(yt, start="2000-01-01", progress=False, auto_adjust=True)
-        if not df3.empty:
-            s3 = df3["Close"].squeeze().dropna()
-            s3.index = pd.to_datetime(s3.index)
-            return s3.rename("yield")
-    except:
-        pass
-
-    st.error("所有殖利率資料來源均失敗，請稍後再試。")
-    return pd.Series(dtype=float)
+        st.error(f"殖利率資料讀取失敗：{e}")
+        return pd.Series(dtype=float)
 
 # ==========================================
 # 並行載入所有標的資料
@@ -401,6 +383,9 @@ st.plotly_chart(fig_yield, use_container_width=True)
 # ==========================================
 periods = list(HOLDING_PERIODS.keys())
 
+# 基金名稱集合
+fund_name_set = set(FUND_DB.values())
+
 for thr in sorted(thresholds):
     events = find_breakout_events(yield_data, thr)
     if not events:
@@ -413,19 +398,18 @@ for thr in sorted(thresholds):
         ev_strs += f"…等{len(events)}次"
     st.caption(f"突破日期：{ev_strs}")
 
-    # 計算平均績效
-    rows = []
-    for name, series in sorted(all_series.items()):
-        row = {"標的": name}
-        for pname, days in HOLDING_PERIODS.items():
-            perfs = [calc_perf(series, ev, days) for ev in events]
-            perfs = [p for p in perfs if p is not None]
-            row[pname] = np.mean(perfs) if perfs else np.nan
-        rows.append(row)
+    # 計算平均績效（全部標的）
+    def build_result_df(series_dict):
+        rows = []
+        for name, series in sorted(series_dict.items()):
+            row = {"標的": name}
+            for pname, days in HOLDING_PERIODS.items():
+                perfs = [calc_perf(series, ev, days) for ev in events]
+                perfs = [p for p in perfs if p is not None]
+                row[pname] = np.mean(perfs) if perfs else np.nan
+            rows.append(row)
+        return pd.DataFrame(rows).set_index("標的")
 
-    result_df = pd.DataFrame(rows).set_index("標的")
-
-    # 顏色函式
     def color_cell(val):
         if pd.isna(val): return "color:#999"
         if val >=  0.05: return "background:#c8e6c9;color:#1b5e20;font-weight:bold"
@@ -435,35 +419,54 @@ for thr in sorted(thresholds):
         if val >= -0.05: return "background:#ffe0b2;color:#e65100"
         return "background:#ffcdd2;color:#b71c1c;font-weight:bold"
 
-    st.dataframe(
-        result_df.style
-            .map(color_cell)
-            .format(lambda x: f"{x:.2%}" if not pd.isna(x) else "-"),
-        use_container_width=True, height=600
-    )
+    def show_result_tab(df, show_chart=True, palette=None):
+        if df.empty:
+            st.info("無資料")
+            return
+        st.dataframe(
+            df.style.map(color_cell)
+              .format(lambda x: f"{x:.2%}" if not pd.isna(x) else "-"),
+            use_container_width=True, height=min(50 + len(df) * 36, 700)
+        )
+        if show_chart and palette:
+            fig = go.Figure()
+            for i, nm in enumerate(df.index):
+                vals = [df.loc[nm, p] * 100 if not pd.isna(df.loc[nm, p]) else None for p in periods]
+                fig.add_trace(go.Scatter(
+                    x=periods, y=vals, mode="lines+markers",
+                    name=nm[:18], connectgaps=False,
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    marker=dict(size=7)
+                ))
+            fig.add_hline(y=0, line_dash="dash", line_color="#888")
+            fig.update_layout(height=400, yaxis_title="平均累積報酬（%）",
+                hovermode="x unified", plot_bgcolor="#f8f9ff",
+                legend=dict(font=dict(size=10)))
+            st.plotly_chart(fig, use_container_width=True)
 
-    # 折線圖（只顯示基金，債券太多線會亂）
-    st.markdown("**基金績效趨勢（各持有期間）**")
-    fig_f = go.Figure()
-    fund_names = [FUND_DB[t] for t in FUND_DB if FUND_DB[t] in result_df.index]
     palette = ["#1565c0","#c62828","#2e7d32","#6a1b9a","#e65100",
                "#00838f","#ad1457","#f57f17","#4527a0","#00695c",
                "#558b2f","#0277bd","#4e342e","#37474f","#1a237e",
                "#880e4f","#1b5e20","#bf360c"]
-    for i, nm in enumerate(fund_names):
-        if nm not in result_df.index: continue
-        vals = [result_df.loc[nm, p] * 100 if not pd.isna(result_df.loc[nm, p]) else None for p in periods]
-        fig_f.add_trace(go.Scatter(
-            x=periods, y=vals, mode="lines+markers",
-            name=nm[:16], connectgaps=False,
-            line=dict(color=palette[i % len(palette)], width=2),
-            marker=dict(size=7)
-        ))
-    fig_f.add_hline(y=0, line_dash="dash", line_color="#888")
-    fig_f.update_layout(height=380, yaxis_title="平均累積報酬（%）",
-        hovermode="x unified", plot_bgcolor="#f8f9ff",
-        legend=dict(font=dict(size=10)))
-    st.plotly_chart(fig_f, use_container_width=True)
+
+    # 分離基金和債券
+    fund_series_local  = {k: v for k, v in all_series.items() if k in fund_name_set}
+    bond_series_local  = {k: v for k, v in all_series.items() if k not in fund_name_set}
+
+    tab_fund, tab_bond = st.tabs([
+        f"📊 基金（{len(fund_series_local)} 檔）",
+        f"🏦 債券（{len(bond_series_local)} 筆）"
+    ])
+
+    with tab_fund:
+        st.markdown(f"**突破 {thr}% 後各持有期間平均報酬（基金）**")
+        fund_df = build_result_df(fund_series_local)
+        show_result_tab(fund_df, show_chart=True, palette=palette)
+
+    with tab_bond:
+        st.markdown(f"**突破 {thr}% 後各持有期間平均報酬（債券）**")
+        bond_df = build_result_df(bond_series_local)
+        show_result_tab(bond_df, show_chart=False)
 
     # 詳細明細
     if show_detail:
